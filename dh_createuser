@@ -1,0 +1,192 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+dh_createuser - create or delete system users and groups
+
+=head1 SYNOPSIS
+
+B<dh_createuser> [B<-r>] [B<username>] [B<group>]
+
+=head1 DESCRIPTION
+
+This program is used by packages to create and delete system users and groups.
+
+It tracks which packages require which users and groups in order to enable
+deleting users and groups when packages are removed.
+
+It's recommended to name the users and groups "debian-<lowercasename>" e.g. debian-tor
+
+Usage:
+To create a system user and group, run
+dh_createuser <username> <groupname>
+from the F<preinst>/F<postinst> scripts. If multiple binary packages require the same user/group make sure you run dh_createuser in all of them.
+Make sure you also run dh_createuser to delete the user/group on each package removal / purge.
+
+To delete a system user and group, run
+dh_createuser -r <username> <groupname>
+from the F<prerm>/F<postrm> scripts.
+
+Package A is being installed and runs dh_createuser debian-bob debian-bob - the user and group are created
+Package B is being installed and runs the same command - dh_createuser does not attempt to recreate user and group
+Package A is being removed: dh_createuser does not remove the user/group as it's still needed by B
+Package B is being removed: the user/group are removed
+
+Caveats:
+
+Files:
+ /etc/dh_createuser.users and /etc/dh_createuser.groups
+
+=cut
+
+use strict;
+use warnings;
+use File::Basename;
+use File::Spec::Functions;
+use Debian::Debhelper::Dh_Lib;
+
+init();
+
+my $myname = basename($0);
+my $db_dir = "/etc/dh_createuser";
+my $user_db_fname = "users";
+my $group_db_fname = "groups";
+my $user_group_db_fname = "user-groups";
+
+my ($add, $username, $groupname, $package) = @ARGV;
+
+sub load {
+    # Load database file from $db_dir, create it if needed
+    my ($fname) = @_;
+    $fname = catfile($db_dir, $fname);
+    unless(-d $db_dir) {
+        print("$myname: creating $db_dir\n");
+        mkdir($db_dir) or die "$myname: Unable to create directory $db_dir";
+    }
+    unless(-e $fname) {
+        print("$myname: creating $fname\n");
+        my @stub = "# Created by dh_createuser, see its manpage";
+        save($fname, @stub);
+    }
+    open ("handle", $fname) or die "$myname: Cannot open $fname: $!";
+    chomp(my @lines = <handle>);
+    close "handle";
+    return @lines;
+}
+
+sub save {
+    # Save database file using a temporary file then rename it
+    my ($fname, @lines) = @_;
+    my $tmpfn = $fname . ".tmp";
+    open my $fh, '>', $tmpfn or die "$myname: Cannot open $tmpfn: $!";
+    foreach (@lines) { if ( $_ ne "" ) { print $fh "$_\n"; } }
+    close $fh;
+    rename $tmpfn, $fname
+}
+
+sub add_entry {
+    # Add entry to the user or group database
+    my ($db_fname, $headername, $pkgname) = @_;
+    my @lines = load($db_fname);
+    my $header_found = 0;
+    foreach my $line (@lines) {
+        if ($line =~ /^$headername /) {
+            my @words = split / /, $line;
+            $header_found = 1;
+            my @pkgs = @words[1..$#words];
+            if ( grep( /^$package$/, @pkgs ) ) {
+                print "$headername contains $pkgname\n";
+            } else {
+                print "$headername now added $pkgname\n";
+                $line .= " $package";
+            }
+        }
+    }
+    if ($header_found == 0) {
+        push @lines, "$headername $pkgname";
+    }
+    save($db_fname, @lines);
+    return $header_found;
+}
+
+sub del_entry {
+    # Delete entry from the user or group database
+    my ($db_fname, $headername, $pkgname) = @_;
+    my @lines = load($db_fname);
+    my $drop = 0;
+    foreach my $line (@lines) {
+        if ($line =~ /^$headername /) {
+            my @words = split / /, $line;
+            my @pkgs = @words[1..$#words];
+            if ( grep( /^$package$/, @pkgs ) ) {
+                print "$headername contains $pkgname, removing it\n";
+                my $index = 0;
+                $index++ until $pkgs[$index] eq $pkgname;
+                splice(@pkgs, $index, 1);
+                if (@pkgs) {
+                    # Other packages are still using this user/group
+                    $line = "$headername @pkgs"
+                } else {
+                    # Remove the line
+                    $drop = 1;
+                    $line = ""
+                }
+            } else {
+                print "$myname: Error: $db_fname: $headername does not contain $pkgname\n";
+            }
+            save($db_fname, @lines);
+            return $drop;
+        }
+    }
+    print "$myname: Error: $headername $pkgname not found in $db_fname\n";
+    return $drop;
+}
+
+if ( $add eq "add" ) {
+    my $found = add_entry($group_db_fname, $groupname, $package);
+    if (! $found) {
+        doit("/usr/sbin/addgroup", "--system", "$groupname");
+    }
+    my $ufound = add_entry($user_db_fname, $username, $package);
+    if (! $ufound) {
+        doit("/usr/sbin/adduser", "--system", "--ingroup",
+            "$groupname", "--no-create-home", "$username");
+    }
+    my $ugfound = add_entry($user_group_db_fname, $username . ":" . $groupname,
+        $package);
+    # It might be the case that the user existed but it was not in the group
+    doit("/usr/sbin/adduser", "--quiet", $username, $groupname)
+
+} else {
+
+    my $drop = del_entry($user_db_fname, $username, $package);
+    if ($drop) {
+        doit("/usr/sbin/deluser", "--system", "$username");
+    }
+    $drop = del_entry($group_db_fname, $groupname, $package);
+    if ($drop) {
+        doit("/usr/sbin/delgroup", "--system", $groupname);
+    }
+    del_entry($user_group_db_fname, $username . ":" . $groupname,
+        $package);
+
+}
+
+foreach my $package (@{$dh{DOPACKAGES}}) {
+}
+
+=head1 SEE ALSO
+
+L<debhelper(7)>
+
+=head1 AUTHOR
+
+Federico Ceratto <federico@debian.org>
+
+=cut
+
+# Local Variables:
+# indent-tabs-mode: t
+# tab-width: 4
+# cperl-indent-level: 4
+# End:
